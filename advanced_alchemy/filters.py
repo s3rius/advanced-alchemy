@@ -75,6 +75,7 @@ __all__ = (
     "ChoicesFilter",
     "CollectionFilter",
     "ComparisonFilter",
+    "Cursor",
     "ExistsFilter",
     "FilterGroup",
     "FilterMap",
@@ -119,6 +120,7 @@ class FilterMap(TypedDict):
     collection: "type[CollectionFilter[Any]]"
     not_in_collection: "type[NotInCollectionFilter[Any]]"
     limit_offset: "type[LimitOffset]"
+    cursor: "type[Cursor]"
     null: "type[NullFilter]"
     not_null: "type[NotNullFilter]"
     order_by: "type[OrderBy]"
@@ -569,6 +571,33 @@ class LimitOffset(PaginationFilter):
         """
         if isinstance(statement, Select):
             statement = cast("StatementTypeT", statement.limit(self.limit).offset(self.offset))
+        return statement
+
+
+@dataclass
+class Cursor(PaginationFilter):
+    limit: int
+    cursor: Optional[str]
+    field_name: FilterFieldName
+    sort_order: Literal["asc", "desc"] = "asc"
+
+    def append_to_statement(
+        self,
+        statement: StatementTypeT,
+        model: type[ModelT],
+    ) -> StatementTypeT:
+        if isinstance(statement, Select):
+            field = self._get_instrumented_attr(model, self.field_name)
+            if self.sort_order == "asc":
+                new_statement = statement.order_by(field.asc())
+                if self.cursor is not None:
+                    new_statement = new_statement.where(field > self.cursor)
+            else:
+                new_statement = statement.order_by(field.desc())
+                if self.cursor is not None:
+                    new_statement = new_statement.where(field < self.cursor)
+
+            statement = cast("StatementTypeT", new_statement.limit(self.limit))
         return statement
 
 
@@ -1170,6 +1199,7 @@ class MultiFilter(StatementFilter):
         "collection": CollectionFilter,
         "not_in_collection": NotInCollectionFilter,
         "limit_offset": LimitOffset,
+        "cursor": Cursor,
         "null": NullFilter,
         "not_null": NotNullFilter,
         "order_by": OrderBy,
@@ -1278,5 +1308,6 @@ FilterTypes: TypeAlias = Union[
     ComparisonFilter,
     MultiFilter,
     FilterGroup,
+    Cursor,
 ]
 """Aggregate type alias of the types supported for collection filtering."""

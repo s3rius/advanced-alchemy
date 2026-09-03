@@ -1,5 +1,5 @@
 import datetime
-from typing import Optional
+from typing import Optional, Union
 
 from sqlalchemy import DateTime
 from sqlalchemy.engine import Dialect
@@ -21,9 +21,15 @@ class DateTimeUTC(TypeDecorator[datetime.datetime]):
     def python_type(self) -> type[datetime.datetime]:
         return datetime.datetime
 
-    def process_bind_param(self, value: Optional[datetime.datetime], dialect: Dialect) -> Optional[datetime.datetime]:
+    def process_bind_param(
+        self,
+        value: Optional[Union[datetime.datetime, str]],
+        dialect: Dialect,
+    ) -> Optional[datetime.datetime]:
         if value is None:
             return value
+        if isinstance(value, str):
+            value = datetime.datetime.fromisoformat(value)
         if not value.tzinfo:
             msg = "tzinfo is required"
             raise TypeError(msg)

@@ -79,7 +79,7 @@ class FilterConfig(TypedDict):
     """Default field or fields to use for sorting."""
     sort_order: NotRequired[SortOrder]
     """Default sort order."""
-    pagination_type: NotRequired[Literal["limit_offset"]]
+    pagination_type: NotRequired[Literal["limit_offset", "cursor"]]
     """Pagination mode to enable."""
     pagination_size: NotRequired[int]
     """Default pagination size."""
