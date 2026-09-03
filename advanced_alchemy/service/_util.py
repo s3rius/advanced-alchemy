@@ -17,7 +17,7 @@ from sqlalchemy.orm import InstrumentedAttribute
 
 from advanced_alchemy.base import ModelProtocol
 from advanced_alchemy.exceptions import AdvancedAlchemyError
-from advanced_alchemy.filters import Cursor, LimitOffset, StatementFilter
+from advanced_alchemy.filters import Cursor, LimitOffset, StatementFilter, encode_cursor_value
 from advanced_alchemy.repository.typing import ModelOrRowMappingT, PrimaryKeyType
 from advanced_alchemy.service.pagination import CursorPagination, OffsetPagination
 from advanced_alchemy.typing import (
@@ -316,7 +316,14 @@ class ResultConverter:
             casted_data = cast("Sequence[ModelOrRowMappingT]", data)
             return cast(
                 "Union[OffsetPagination[ModelOrRowMappingT], CursorPagination[ModelOrRowMappingT]]",
-                _create_pagination(casted_data, casted_data, filters, total, pagination_type),
+                _create_pagination(
+                    casted_data,
+                    casted_data,
+                    filters,
+                    total,
+                    pagination_type,
+                    model_type=getattr(self, "model_type", None),
+                ),
             )
         if MSGSPEC_INSTALLED and issubclass(schema_type, Struct):
             if not isinstance(data, Sequence):
@@ -344,7 +351,14 @@ class ResultConverter:
             casted_data = cast("Sequence[ModelOrRowMappingT]", data)
             return cast(
                 "Union[OffsetPagination[ModelDTOT], CursorPagination[ModelDTOT]]",
-                _create_pagination(casted_data, converted_items, filters, total, pagination_type),
+                _create_pagination(
+                    casted_data,
+                    converted_items,
+                    filters,
+                    total,
+                    pagination_type,
+                    model_type=getattr(self, "model_type", None),
+                ),
             )
 
         if PYDANTIC_INSTALLED and issubclass(schema_type, BaseModel):
@@ -357,7 +371,14 @@ class ResultConverter:
             casted_data = cast("Sequence[ModelOrRowMappingT]", data)
             return cast(
                 "Union[OffsetPagination[ModelDTOT], CursorPagination[ModelDTOT]]",
-                _create_pagination(casted_data, validated_items, filters, total, pagination_type),
+                _create_pagination(
+                    casted_data,
+                    validated_items,
+                    filters,
+                    total,
+                    pagination_type,
+                    model_type=getattr(self, "model_type", None),
+                ),
             )
         if CATTRS_INSTALLED and is_attrs_schema(schema_type):
             if not isinstance(data, Sequence):
@@ -366,7 +387,14 @@ class ResultConverter:
             casted_data = cast("Sequence[ModelOrRowMappingT]", data)
             return cast(
                 "Union[OffsetPagination[ModelDTOT], CursorPagination[ModelDTOT]]",
-                _create_pagination(casted_data, structured_items, filters, total, pagination_type),
+                _create_pagination(
+                    casted_data,
+                    structured_items,
+                    filters,
+                    total,
+                    pagination_type,
+                    model_type=getattr(self, "model_type", None),
+                ),
             )
 
         if ATTRS_INSTALLED and is_attrs_schema(schema_type):
@@ -380,7 +408,14 @@ class ResultConverter:
             casted_data = cast("Sequence[ModelOrRowMappingT]", data)
             return cast(
                 "Union[OffsetPagination[ModelDTOT], CursorPagination[ModelDTOT]]",
-                _create_pagination(casted_data, converted_items, filters, total, pagination_type),
+                _create_pagination(
+                    casted_data,
+                    converted_items,
+                    filters,
+                    total,
+                    pagination_type,
+                    model_type=getattr(self, "model_type", None),
+                ),
             )
 
         if not MSGSPEC_INSTALLED and not PYDANTIC_INSTALLED and not ATTRS_INSTALLED:
@@ -468,6 +503,7 @@ def _create_pagination(
     filters: Any,
     total: "Optional[int]",
     pagination_type: Optional[Literal["offset", "cursor"]],
+    model_type: Optional[Any] = None,
 ) -> "OffsetPagination[Any] | CursorPagination[Any]":
     """Create OffsetPagination with consistent limit_offset logic.
 
@@ -478,7 +514,10 @@ def _create_pagination(
         items: Items to paginate.
         filters: Filters to extract LimitOffset from.
         total: Total count or None.
-        pagination_type: Type of pagination to return. Defaults to LimitOffset.
+        pagination_type: Type of pagination to return.
+            Defaults to LimitOffset if unset.
+        model_type: Type of the model we're returning.
+            Used for primary key extraction.
 
     Returns:
         OffsetPagination or CursorPagination instance, depends on pagination_type.
@@ -493,7 +532,7 @@ def _create_pagination(
         pagination_type = "cursor" if found_cursor is not None else "offset"
 
     if pagination_type == "cursor":
-        return _create_cursor_pagination(found_cursor, original_items, items, filters, total)
+        return _create_cursor_pagination(found_cursor, original_items, items, filters, total, model_type)
 
     return _create_offset_pagination(items, filters, total)
 
@@ -504,6 +543,7 @@ def _create_cursor_pagination(
     items: Any,
     filters: Any,
     total: Optional[int],
+    model_type: Optional[Any] = None,
 ) -> CursorPagination[Any]:
     """Create CursorPagination with consistent limit_offset logic.
 
@@ -516,9 +556,10 @@ def _create_cursor_pagination(
         items: Items to paginate.
         filters: Filters to extract LimitOffset from.
         total: Total count or None.
+        model_type: Model class used to resolve primary key column names.
 
     Returns:
-        OffsetPagination instance.
+        CursorPagination instance.
     """
     cursor = found_cursor or find_filter(Cursor, filters=filters)
     field_name = cursor.field_name if cursor else None
@@ -531,21 +572,46 @@ def _create_cursor_pagination(
     if original_items:
         last_item = original_items[-1]
 
-    next_cursor = None
+    field_value = None
     if last_item and isinstance(last_item, RowMapping):
-        next_cursor = last_item[field_name]
+        field_value = last_item[field_name]
     elif last_item and isinstance(last_item, ModelProtocol):
-        next_cursor = getattr(last_item, field_name)
+        field_value = getattr(last_item, field_name)
 
-    has_more = None
-    if total is not None:
-        has_more = total - len(items) > 0
+    next_cursor = None
+    if field_value is not None:
+        pk_values = _get_pk_values(last_item, model_type)
+        next_cursor = encode_cursor_value(field_value, *(pk_values or ()))
 
     return CursorPagination(
         items=items,
         next_cursor=next_cursor,
-        has_more=has_more,
+        has_more=(total or len(items)) - len(items) > 0,
     )
+
+
+def _get_pk_values(item: Any, model_type: Optional[Any] = None) -> Optional[tuple[Any, ...]]:
+    """Extract primary key value(s) from a model instance or row mapping.
+
+    Args:
+        item: Item to extract primary key values from.
+        model_type: Model class providing the table definition. Falls back to
+            the item's own class when not given.
+
+    Returns:
+        Tuple of primary key values, or None when the table definition is unknown.
+    """
+    table = getattr(item, "__table__", None)
+    if table is None and model_type is not None:
+        table = getattr(model_type, "__table__", None)
+    if table is None:
+        return None
+    pk_names = [column.name for column in table.primary_key.columns]
+    if isinstance(item, RowMapping):
+        return tuple(item[name] for name in pk_names)
+    if isinstance(item, ModelProtocol):
+        return tuple(getattr(item, name) for name in pk_names)
+    return None
 
 
 def _create_offset_pagination(

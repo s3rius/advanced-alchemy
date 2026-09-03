@@ -19,6 +19,7 @@ See Also:
 
 """
 
+import base64
 import datetime
 import logging
 from abc import ABC, abstractmethod
@@ -574,8 +575,61 @@ class LimitOffset(PaginationFilter):
         return statement
 
 
+CURSOR_VALUE_DELIMITER = "|||"
+
+
+def encode_cursor_value(*values: Any) -> str:
+    """Encode cursor values into a single base64 string.
+
+    Values are joined with a delimiter and base64-encoded so the cursor can be
+    carried as a single query parameter or response field.
+
+    Args:
+        *values: The cursor field value followed by the primary key value(s).
+
+    Returns:
+        A single string safe to use as an opaque cursor.
+    """
+    payload = CURSOR_VALUE_DELIMITER.join(str(value) for value in values)
+    return base64.urlsafe_b64encode(payload.encode()).decode()
+
+
+def decode_cursor_value(cursor: str) -> tuple[str, ...]:
+    """Decode a cursor produced by :func:`encode_cursor_value`.
+
+    Args:
+        cursor: The encoded cursor string.
+
+    Returns:
+        The individual cursor values as strings.
+
+    Raises:
+        ValueError: If the cursor is not a valid encoded cursor string.
+    """
+    try:
+        payload = base64.urlsafe_b64decode(cursor.encode()).decode()
+    except (ValueError, UnicodeDecodeError) as e:
+        msg = f"Invalid cursor value: {cursor!r}"
+        raise ValueError(msg) from e
+    return tuple(payload.split(CURSOR_VALUE_DELIMITER))
+
+
 @dataclass
 class Cursor(PaginationFilter):
+    """Keyset (cursor) pagination filter.
+
+    Paginates using a WHERE condition on ``field_name`` instead of OFFSET, which
+    keeps performance stable on large tables.
+
+    To make pagination stable when multiple rows share the same ``field_name``
+    value, the primary key is used as a tiebreaker: both the WHERE condition and
+    the ORDER BY clause include the primary key column(s) as secondary key(s).
+
+    ``cursor`` is ``None`` for the first page, otherwise a single string
+    produced by :func:`encode_cursor_value` holding the ``field_name`` value of
+    the last row of the previous page followed by its primary key value(s).
+    """
+
     limit: int
     cursor: Optional[str]
     field_name: FilterFieldName
@@ -588,17 +642,73 @@ class Cursor(PaginationFilter):
     ) -> StatementTypeT:
         if isinstance(statement, Select):
             field = self._get_instrumented_attr(model, self.field_name)
-            if self.sort_order == "asc":
-                new_statement = statement.order_by(field.asc())
-                if self.cursor is not None:
-                    new_statement = new_statement.where(field > self.cursor)
-            else:
-                new_statement = statement.order_by(field.desc())
-                if self.cursor is not None:
-                    new_statement = new_statement.where(field < self.cursor)
+            pk_columns = list(model.__table__.primary_key)
 
-            statement = cast("StatementTypeT", new_statement.limit(self.limit))
+            if self.sort_order == "asc":
+                new_statement = statement.order_by(field.asc(), *[column.asc() for column in pk_columns]).limit(
+                    self.limit
+                )
+            else:
+                new_statement = statement.order_by(field.desc(), *[column.desc() for column in pk_columns]).limit(
+                    self.limit
+                )
+
+            if self.cursor is not None:
+                values = decode_cursor_value(self.cursor)
+                new_statement = new_statement.where(self._keyset_condition(field, pk_columns, values))
+
+            statement = cast("StatementTypeT", new_statement)
         return statement
+
+    def _keyset_condition(
+        self,
+        field: InstrumentedField,
+        pk_columns: list[Any],
+        values: tuple[str, ...],
+    ) -> ColumnElement[bool]:
+        """Helper to build proper where clause for cursor.
+
+        Generally cursor pagination should only iterate
+        over UNIQUE and Comparable values.
+
+        However, since we want to make this implementation
+        as generic as possible and let people decide,
+        therefore we should also support non-unique columns.
+
+        So, instead of simple `col < cursor`,
+        we should also look at cases where `col = cursor`,
+        to not loose some items.
+
+        For example, in case of a table with a composite
+        primary key (pk1, pk2), we should have:
+
+        field < cursor
+        OR (field == CURSOR AND pk1 < cursor_pk1)
+        OR (field == CURSOR AND pk2 < cursor_pk2)
+
+        In this case, even if the cursor value would point
+        at an object with non-unique field, we will
+        still be able to get next objects without losing any.
+        """
+        expected = 1 + len(pk_columns)
+        if len(values) != expected:
+            msg = (
+                f"Cursor must contain {expected} value(s): the '{self.field_name}' value "
+                f"followed by the primary key value(s), got {len(values)}: {values!r}"
+            )
+            raise ValueError(msg)
+        field_value = values[0]
+        pk_values = values[1:]
+        leading = field < field_value if self.sort_order == "desc" else field > field_value
+        clauses: list[ColumnElement[bool]] = []
+        boundary = field == field_value
+        for pk_column, pk_value in zip(pk_columns, pk_values):
+            if self.sort_order == "desc":
+                clauses.append(boundary & (pk_column < pk_value))
+            else:
+                clauses.append(boundary & (pk_column > pk_value))
+            boundary = boundary & (pk_column == pk_value)
+        return or_(leading, *clauses)
 
 
 @dataclass
